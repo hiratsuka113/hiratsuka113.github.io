@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Delayed Camera (Delay-linked RGB Shift)</title>
+  <title>Delayed Camera (Strong RGB Split)</title>
   <style>
     html, body { margin:0; height:100%; background:#000; overflow:hidden; }
     canvas { width:100%; height:100%; display:block; }
@@ -56,8 +56,13 @@
     </div>
 
     <div class="row">
-      <label>色ズレの最大量 (px): <span id="rgbMaxLabel">24</span></label>
-      <input id="rgbMax" type="range" min="0" max="80" value="24" />
+      <label>色ズレの最大量 (px): <span id="rgbMaxLabel">36</span></label>
+      <input id="rgbMax" type="range" min="0" max="120" value="36" />
+    </div>
+
+    <div class="row">
+      <label>色ズレの強さ (0〜1): <span id="rgbPowerLabel">0.85</span></label>
+      <input id="rgbPower" type="range" min="0" max="100" value="85" />
     </div>
 
     <button id="toggle">ゆらぎ: ON（タップで切替）</button>
@@ -78,11 +83,13 @@
   const maxDelayEl = document.getElementById('maxDelay');
   const speedEl = document.getElementById('speed');
   const rgbMaxEl = document.getElementById('rgbMax');
+  const rgbPowerEl = document.getElementById('rgbPower');
 
   const minLabel = document.getElementById('minLabel');
   const maxLabel = document.getElementById('maxLabel');
   const speedLabel = document.getElementById('speedLabel');
   const rgbMaxLabel = document.getElementById('rgbMaxLabel');
+  const rgbPowerLabel = document.getElementById('rgbPowerLabel');
 
   const toggleBtn = document.getElementById('toggle');
   let wobbleOn = true;
@@ -91,8 +98,18 @@
     const dpr = Math.max(1, window.devicePixelRatio || 1);
     cv.width = Math.floor(innerWidth * dpr);
     cv.height = Math.floor(innerHeight * dpr);
+    // オフスクリーンも追従
+    off1.width = cv.width; off1.height = cv.height;
+    off2.width = cv.width; off2.height = cv.height;
   }
   addEventListener('resize', resize);
+
+  // ---- オフスクリーン（使い回し） ----
+  const off1 = document.createElement('canvas');
+  const off2 = document.createElement('canvas');
+  const o1 = off1.getContext('2d', { alpha:true });
+  const o2 = off2.getContext('2d', { alpha:true });
+
   resize();
 
   // ---- カメラ（背面） ----
@@ -119,11 +136,13 @@
     speedLabel.textContent = hz.toFixed(2);
 
     rgbMaxLabel.textContent = String(Number(rgbMaxEl.value));
+    rgbPowerLabel.textContent = (Number(rgbPowerEl.value)/100).toFixed(2);
   }
   minDelayEl.addEventListener('input', refreshLabels);
   maxDelayEl.addEventListener('input', refreshLabels);
   speedEl.addEventListener('input', refreshLabels);
   rgbMaxEl.addEventListener('input', refreshLabels);
+  rgbPowerEl.addEventListener('input', refreshLabels);
   refreshLabels();
 
   toggleBtn.addEventListener('click', () => {
@@ -131,15 +150,13 @@
     toggleBtn.textContent = `ゆらぎ: ${wobbleOn ? "ON" : "OFF（固定）"}（タップで切替）`;
   });
 
-  // ---- スムーズランダム（曲線っぽい） ----
+  // ---- スムーズランダム（曲線） ----
   let n0 = Math.random();
   let n1 = Math.random();
   let lastStepT = performance.now();
   let stepInterval = 1000;
 
-  function smoothstep(t){
-    return t * t * (3 - 2 * t);
-  }
+  function smoothstep(t){ return t * t * (3 - 2 * t); }
 
   function getWobble01(now){
     const hz = Number(speedEl.value) / 100; // 0.01..3.00
@@ -170,7 +187,6 @@
     }
   }
 
-  // delayの現在値を計算
   function currentDelayMs(now){
     let minMs = Number(minDelayEl.value);
     let maxMs = Number(maxDelayEl.value);
@@ -182,19 +198,35 @@
     return Math.round(minMs + (maxMs - minMs) * r);
   }
 
-  // 遅延に応じた「バグ度」0..1
+  // 遅延に応じた「バグ度」0..1（後半で強く）
   function bugAmount(delayMs){
     let minMs = Number(minDelayEl.value);
     let maxMs = Number(maxDelayEl.value);
     if (minMs > maxMs) [minMs, maxMs] = [maxMs, minMs];
+
     const denom = Math.max(1, (maxMs - minMs));
     let a = (delayMs - minMs) / denom;
     a = Math.max(0, Math.min(1, a));
-    // ちょい曲線にして「後半で急に増える」感じに
     return a * a; // 0..1
   }
 
-  function drawWithRgbShift(img, shiftPx){
+  // ---- 強い色ズレ：着色したコピーを重ねる ----
+  // 1) ずらして描く
+  // 2) source-in で「形はそのまま、色だけ塗る」
+  // 3) screen でベースに加算合成
+  function drawTintedCopy(offCtx, img, dx, dy, tintRGBA){
+    const w = cv.width, h = cv.height;
+    offCtx.globalCompositeOperation = 'source-over';
+    offCtx.clearRect(0, 0, w, h);
+
+    offCtx.drawImage(img, dx, dy, w, h);
+    offCtx.globalCompositeOperation = 'source-in';
+    offCtx.fillStyle = tintRGBA;
+    offCtx.fillRect(0, 0, w, h);
+    offCtx.globalCompositeOperation = 'source-over';
+  }
+
+  function drawWithStrongRgbSplit(img, shiftPx, strength01){
     const w = cv.width, h = cv.height;
 
     // ベース
@@ -202,22 +234,18 @@
     ctx.globalAlpha = 1.0;
     ctx.drawImage(img, 0, 0, w, h);
 
-    if (shiftPx <= 0.1) return;
+    if (shiftPx <= 0.1 || strength01 <= 0.01) return;
 
-    // RGBっぽく見えるように「ずらして加算」
-    // 色分離を厳密にやるより、軽くてそれっぽい方法
+    // 赤コピー（右に）
+    drawTintedCopy(o1, img, +shiftPx, 0, `rgba(255,0,0,${strength01})`);
+    // シアン（青+緑）コピー（左に）※赤と補色でズレが分かりやすい
+    drawTintedCopy(o2, img, -shiftPx, 0, `rgba(0,255,255,${strength01})`);
+
     ctx.globalCompositeOperation = 'screen';
-
-    // 赤寄り（右に）
-    ctx.globalAlpha = 0.22;
-    ctx.drawImage(img, +shiftPx, 0, w, h);
-
-    // 青寄り（左に）
-    ctx.globalAlpha = 0.18;
-    ctx.drawImage(img, -shiftPx, 0, w, h);
-
-    // 仕上げ
     ctx.globalAlpha = 1.0;
+    ctx.drawImage(off1, 0, 0);
+    ctx.drawImage(off2, 0, 0);
+
     ctx.globalCompositeOperation = 'source-over';
   }
 
@@ -228,15 +256,16 @@
     const delayMs = currentDelayMs(now);
     msNow.textContent = String(delayMs);
 
-    // 遅延→バグ度→色ズレ量
     const a = bugAmount(delayMs); // 0..1
     const dpr = Math.max(1, window.devicePixelRatio || 1);
+
     const rgbMax = Number(rgbMaxEl.value) * dpr;
     const shiftPx = rgbMax * a;
-
     rgbNow.textContent = (shiftPx / dpr).toFixed(1);
 
-    // 遅延分のフレームを選ぶ
+    const strength = (Number(rgbPowerEl.value)/100) * (0.15 + 0.85*a); 
+    // 遅延が小さい時でもほんの少し出る。遅延が大きいと一気に強くなる。
+
     const targetTime = now - delayMs;
     while (queue.length >= 2 && queue[1].t <= targetTime) {
       queue[0].img.close?.();
@@ -244,7 +273,7 @@
     }
 
     const frame = queue[0]?.img;
-    if (frame) drawWithRgbShift(frame, shiftPx);
+    if (frame) drawWithStrongRgbSplit(frame, shiftPx, strength);
 
     requestAnimationFrame(() => loop().catch(console.error));
   }
@@ -254,6 +283,7 @@
 </script>
 </body>
 </html>
+
 
 
 
