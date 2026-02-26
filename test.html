@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Delayed Camera (JS)</title>
+  <style>
+    html, body { margin:0; height:100%; background:#000; overflow:hidden; }
+    canvas { width:100%; height:100%; display:block; }
+    .ui {
+      position:fixed; top:10px; left:10px;
+      color:#fff; font-family: ui-monospace, Menlo, monospace;
+      background: rgba(0,0,0,0.35); padding:8px 10px; border:1px solid rgba(255,255,255,0.25);
+      border-radius: 10px;
+    }
+    input { width: 220px; }
+  </style>
+</head>
+<body>
+  <canvas id="cv"></canvas>
+
+  <div class="ui">
+    Delay: <span id="msLabel">250</span>ms<br>
+    <input id="delay" type="range" min="0" max="800" value="250" />
+  </div>
+
+<script>
+(async () => {
+  const cv = document.getElementById('cv');
+  const ctx = cv.getContext('2d', { alpha:false });
+
+  const slider = document.getElementById('delay');
+  const msLabel = document.getElementById('msLabel');
+
+  // 遅延時間（ms）
+  let delayMs = Number(slider.value);
+  slider.addEventListener('input', () => {
+    delayMs = Number(slider.value);
+    msLabel.textContent = String(delayMs);
+  });
+
+  // 画面サイズに合わせてCanvasの実ピクセルを設定
+  function resize() {
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    cv.width = Math.floor(innerWidth * dpr);
+    cv.height = Math.floor(innerHeight * dpr);
+  }
+  addEventListener('resize', resize);
+  resize();
+
+  // カメラ取得
+  const video = document.createElement('video');
+  video.playsInline = true;
+  video.muted = true;
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "environment" },
+    audio: false
+  });
+  video.srcObject = stream;
+  await video.play();
+
+  // フレームを「時刻付き」で貯める
+  // { t: timestamp, img: ImageBitmap }
+  const queue = [];
+
+  // メモリ節約用：最大保持時間（ms）
+  const maxHoldMs = 2000;
+
+  async function captureFrame() {
+    // createImageBitmap は速くて便利（対応してない環境は後で代替可）
+    const bmp = await createImageBitmap(video);
+    queue.push({ t: performance.now(), img: bmp });
+
+    // 古いフレームは捨てる（2秒以上前）
+    const now = performance.now();
+    while (queue.length && (now - queue[0].t) > maxHoldMs) {
+      queue[0].img.close?.(); // ImageBitmapの解放（対応環境のみ）
+      queue.shift();
+    }
+  }
+
+  function drawFrame(img) {
+    const w = cv.width, h = cv.height;
+
+    // 画面にフィット（縦横比は気にせずフィル）
+    ctx.drawImage(img, 0, 0, w, h);
+  }
+
+  async function loop() {
+    // 1) 最新フレームを1枚キャプチャしてキューに入れる
+    // ※ await が入るので、重すぎたら「数フレームに1回だけ」にしてもOK
+    await captureFrame();
+
+    // 2) delayMs だけ古いフレームを探して表示する
+    const now = performance.now();
+    const targetTime = now - delayMs;
+
+    // キューが増えたら、目的時刻に一番近いフレームを使う
+    // （単純に前から進める）
+    while (queue.length >= 2 && queue[1].t <= targetTime) {
+      // もう使わない先頭フレームは解放して捨てる
+      queue[0].img.close?.();
+      queue.shift();
+    }
+
+    // 表示するフレーム（なければ最新）
+    const frame = queue[0]?.img;
+    if (frame) drawFrame(frame);
+
+    requestAnimationFrame(() => { loop().catch(console.error); });
+  }
+
+  loop().catch(console.error);
+})();
+</script>
+</body>
+</html>
