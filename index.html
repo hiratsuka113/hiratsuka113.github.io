@@ -3,25 +3,63 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Delayed Camera (JS)</title>
+  <title>Delayed Camera (Smooth Random Delay)</title>
   <style>
     html, body { margin:0; height:100%; background:#000; overflow:hidden; }
     canvas { width:100%; height:100%; display:block; }
     .ui {
       position:fixed; top:10px; left:10px;
       color:#fff; font-family: ui-monospace, Menlo, monospace;
-      background: rgba(0,0,0,0.35); padding:8px 10px; border:1px solid rgba(255,255,255,0.25);
-      border-radius: 10px;
+      background: rgba(0,0,0,0.35); padding:10px 12px;
+      border:1px solid rgba(255,255,255,0.25); border-radius: 12px;
+      line-height: 1.35;
+      user-select: none;
     }
-    input { width: 220px; }
+    .row { margin-top: 8px; }
+    label { display:block; font-size: 12px; opacity: 0.9; margin-bottom: 4px; }
+    input[type="range"] { width: 260px; }
+    .pill {
+      display:inline-block; padding:4px 8px; border:1px solid rgba(255,255,255,0.25);
+      border-radius: 999px; font-size: 12px; opacity:0.9;
+    }
+    button {
+      margin-top: 8px;
+      padding:6px 10px;
+      border:1px solid rgba(255,255,255,0.25);
+      border-radius:10px;
+      background: rgba(255,255,255,0.06);
+      color:#fff;
+      font-family: inherit;
+    }
   </style>
 </head>
 <body>
   <canvas id="cv"></canvas>
 
   <div class="ui">
-    Delay: <span id="msLabel">250</span>ms<br>
-    <input id="delay" type="range" min="0" max="800" value="250" />
+    <div class="pill">LIVE</div>
+    <div>Delay: <b><span id="msNow">---</span></b> ms</div>
+
+    <div class="row">
+      <label>遅延の下限 (min ms): <span id="minLabel">150</span></label>
+      <input id="minDelay" type="range" min="0" max="2000" value="150" />
+    </div>
+
+    <div class="row">
+      <label>遅延の上限 (max ms): <span id="maxLabel">1200</span></label>
+      <input id="maxDelay" type="range" min="0" max="3000" value="1200" />
+    </div>
+
+    <div class="row">
+      <label>ゆらぎの速さ (Hz): <span id="speedLabel">0.25</span></label>
+      <input id="speed" type="range" min="1" max="300" value="25" />
+      <!-- 1..300 を 0.01..3.00Hz にマッピング -->
+    </div>
+
+    <button id="toggle">ゆらぎ: ON（タップで切替）</button>
+    <div style="opacity:0.7; font-size:12px; margin-top:6px;">
+      ※遅延が大きいほど酔いやすいので、まずは max 800〜1500ms で試すのがおすすめ
+    </div>
   </div>
 
 <script>
@@ -29,17 +67,18 @@
   const cv = document.getElementById('cv');
   const ctx = cv.getContext('2d', { alpha:false });
 
-  const slider = document.getElementById('delay');
-  const msLabel = document.getElementById('msLabel');
+  const msNow = document.getElementById('msNow');
+  const minDelayEl = document.getElementById('minDelay');
+  const maxDelayEl = document.getElementById('maxDelay');
+  const speedEl = document.getElementById('speed');
 
-  // 遅延時間（ms）
-  let delayMs = Number(slider.value);
-  slider.addEventListener('input', () => {
-    delayMs = Number(slider.value);
-    msLabel.textContent = String(delayMs);
-  });
+  const minLabel = document.getElementById('minLabel');
+  const maxLabel = document.getElementById('maxLabel');
+  const speedLabel = document.getElementById('speedLabel');
 
-  // 画面サイズに合わせてCanvasの実ピクセルを設定
+  const toggleBtn = document.getElementById('toggle');
+  let wobbleOn = true;
+
   function resize() {
     const dpr = Math.max(1, window.devicePixelRatio || 1);
     cv.width = Math.floor(innerWidth * dpr);
@@ -48,7 +87,7 @@
   addEventListener('resize', resize);
   resize();
 
-  // カメラ取得
+  // ---- カメラ（背面） ----
   const video = document.createElement('video');
   video.playsInline = true;
   video.muted = true;
@@ -60,55 +99,106 @@
   video.srcObject = stream;
   await video.play();
 
-  // フレームを「時刻付き」で貯める
-  // { t: timestamp, img: ImageBitmap }
-  const queue = [];
+  // ---- UI反映 ----
+  function refreshLabels(){
+    let minMs = Number(minDelayEl.value);
+    let maxMs = Number(maxDelayEl.value);
+    if (minMs > maxMs) [minMs, maxMs] = [maxMs, minMs];
+    minLabel.textContent = String(minMs);
+    maxLabel.textContent = String(maxMs);
 
-  // メモリ節約用：最大保持時間（ms）
-  const maxHoldMs = 2000;
+    const hz = Number(speedEl.value) / 100; // 0.01..3.00
+    speedLabel.textContent = hz.toFixed(2);
+  }
+  minDelayEl.addEventListener('input', refreshLabels);
+  maxDelayEl.addEventListener('input', refreshLabels);
+  speedEl.addEventListener('input', refreshLabels);
+  refreshLabels();
 
-  async function captureFrame() {
-    // createImageBitmap は速くて便利（対応してない環境は後で代替可）
+  toggleBtn.addEventListener('click', () => {
+    wobbleOn = !wobbleOn;
+    toggleBtn.textContent = `ゆらぎ: ${wobbleOn ? "ON" : "OFF（固定）"}（タップで切替）`;
+  });
+
+  // ---- 遅延を「曲線っぽくランダム」にする：スムーズノイズ ----
+  // 仕組み：一定間隔で新しい乱数ターゲットを作り、滑らかに補間する（= 曲線）
+  let n0 = Math.random();
+  let n1 = Math.random();
+  let lastStepT = performance.now();
+  let stepInterval = 1000; // ms（後でHzから動的に決める）
+
+  // smoothstep: 0..1 を滑らかに（曲線）変換
+  function smoothstep(t){
+    return t * t * (3 - 2 * t);
+  }
+
+  function getWobble01(now){
+    // speed(Hz)が高いほど target更新が早い（=ゆらぎが速い）
+    const hz = Number(speedEl.value) / 100;      // 0.01..3.00
+    stepInterval = 1 / Math.max(0.01, hz) * 1000; // ms
+
+    // 目標値を更新
+    while ((now - lastStepT) > stepInterval) {
+      lastStepT += stepInterval;
+      n0 = n1;
+      n1 = Math.random();
+    }
+
+    const t = Math.min(1, Math.max(0, (now - lastStepT) / stepInterval));
+    const s = smoothstep(t);               // 曲線っぽい補間
+    return n0 + (n1 - n0) * s;             // 0..1付近
+  }
+
+  // ---- フレームを貯める ----
+  const queue = []; // {t, img: ImageBitmap}
+  const maxHoldMs = 6000; // 遅延maxを大きくしたいので保持も増やす
+
+  async function captureFrame(){
     const bmp = await createImageBitmap(video);
     queue.push({ t: performance.now(), img: bmp });
 
-    // 古いフレームは捨てる（2秒以上前）
     const now = performance.now();
     while (queue.length && (now - queue[0].t) > maxHoldMs) {
-      queue[0].img.close?.(); // ImageBitmapの解放（対応環境のみ）
+      queue[0].img.close?.();
       queue.shift();
     }
   }
 
-  function drawFrame(img) {
+  function drawFrame(img){
     const w = cv.width, h = cv.height;
-
-    // 画面にフィット（縦横比は気にせずフィル）
     ctx.drawImage(img, 0, 0, w, h);
   }
 
-  async function loop() {
-    // 1) 最新フレームを1枚キャプチャしてキューに入れる
-    // ※ await が入るので、重すぎたら「数フレームに1回だけ」にしてもOK
+  function currentDelayMs(now){
+    let minMs = Number(minDelayEl.value);
+    let maxMs = Number(maxDelayEl.value);
+    if (minMs > maxMs) [minMs, maxMs] = [maxMs, minMs];
+
+    if (!wobbleOn) return Math.round((minMs + maxMs) / 2);
+
+    const r = getWobble01(now);              // 0..1の滑らかな乱数
+    const ms = minMs + (maxMs - minMs) * r;  // 範囲にマップ
+    return Math.round(ms);
+  }
+
+  async function loop(){
     await captureFrame();
 
-    // 2) delayMs だけ古いフレームを探して表示する
     const now = performance.now();
+    const delayMs = currentDelayMs(now);
+    msNow.textContent = String(delayMs);
+
     const targetTime = now - delayMs;
 
-    // キューが増えたら、目的時刻に一番近いフレームを使う
-    // （単純に前から進める）
     while (queue.length >= 2 && queue[1].t <= targetTime) {
-      // もう使わない先頭フレームは解放して捨てる
       queue[0].img.close?.();
       queue.shift();
     }
 
-    // 表示するフレーム（なければ最新）
     const frame = queue[0]?.img;
     if (frame) drawFrame(frame);
 
-    requestAnimationFrame(() => { loop().catch(console.error); });
+    requestAnimationFrame(() => loop().catch(console.error));
   }
 
   loop().catch(console.error);
